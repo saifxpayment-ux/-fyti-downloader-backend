@@ -1,5 +1,4 @@
-
-import os
+import logging
 import re
 import shutil
 import tempfile
@@ -13,16 +12,17 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
-app = FastAPI(title="FYTI Downloader API")
+# Logging: show actual errors in Render logs
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("fyti")
 
-# Connect your website here after backend deployment.
-# For initial testing, allow browser requests from any origin.
-# Restrict this before public production use.
+app = FastAPI(title="FYTI Downloader API", version="1.1.0")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -38,6 +38,16 @@ ALLOWED_HOSTS = {
 
 MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 
+QUALITY_MAP = {
+    "460p": "best[height<=460][ext=mp4]/best[height<=460]/best",
+    "480p": "best[height<=480][ext=mp4]/best[height<=480]/best",
+    "540p": "best[height<=540][ext=mp4]/best[height<=540]/best",
+    "720p": "best[height<=720][ext=mp4]/best[height<=720]/best",
+    "1080p": "best[height<=1080][ext=mp4]/best[height<=1080]/best",
+    "2k": "best[height<=1440][ext=mp4]/best[height<=1440]/best",
+    "4k": "best[height<=2160][ext=mp4]/best[height<=2160]/best",
+}
+
 
 class VideoRequest(BaseModel):
     url: str = Field(min_length=8, max_length=2048)
@@ -45,8 +55,10 @@ class VideoRequest(BaseModel):
 
 
 def validate_url(url: str) -> str:
+    url = url.strip()
+
     try:
-        parsed = urlparse(url.strip())
+        parsed = urlparse(url)
         host = (parsed.hostname or "").lower().rstrip(".")
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid URL.")
@@ -57,18 +69,16 @@ def validate_url(url: str) -> str:
             detail="Only HTTPS video URLs are accepted.",
         )
 
-    allowed = any(
+    if not any(
         host == domain or host.endswith("." + domain)
         for domain in ALLOWED_HOSTS
-    )
-
-    if not allowed:
+    ):
         raise HTTPException(
             status_code=400,
             detail="This video platform is not supported.",
         )
 
-    return url.strip()
+    return url
 
 
 @app.get("/")
@@ -76,7 +86,9 @@ def home():
     return {
         "service": "FYTI Downloader API",
         "status": "running",
+        "version": "1.1.0",
         "docs": "/docs",
+        "health": "/health",
     }
 
 
@@ -94,7 +106,8 @@ def video_info(request: VideoRequest):
         "no_warnings": True,
         "noplaylist": True,
         "skip_download": True,
-        "socket_timeout": 15,
+        "socket_timeout": 20,
+        "retries": 2,
     }
 
     try:
@@ -116,12 +129,13 @@ def video_info(request: VideoRequest):
 
     except HTTPException:
         raise
-    except Exception:
+    except Exception as exc:
+        logger.exception("FYTI video info failed: %s", exc)
         raise HTTPException(
             status_code=422,
             detail=(
-                "Could not read this video. It may be private, "
-                "restricted, or unsupported."
+                "Could not read this video. Check Render logs "
+                "for the actual error."
             ),
         )
 
@@ -129,20 +143,9 @@ def video_info(request: VideoRequest):
 @app.post("/download")
 def download_video(request: VideoRequest):
     url = validate_url(request.url)
+    quality = request.quality.lower().strip()
 
-    quality_map = {
-        "460p": "best[height<=460]/best",
-        "480p": "best[height<=480]/best",
-        "540p": "best[height<=540]/best",
-        "720p": "best[height<=720]/best",
-        "1080p": "best[height<=1080]/best",
-        "2k": "best[height<=1440]/best",
-        "4k": "best[height<=2160]/best",
-    }
-
-    quality = request.quality.lower()
-
-    if quality not in quality_map:
+    if quality not in QUALITY_MAP:
         raise HTTPException(
             status_code=400,
             detail="Choose a supported quality.",
@@ -152,55 +155,52 @@ def download_video(request: VideoRequest):
     folder = Path(temp_dir)
 
     options = {
-        "format": quality_map[quality],
+        "format": QUALITY_MAP[quality],
         "outtmpl": str(folder / "%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "restrictfilenames": True,
         "max_filesize": MAX_DOWNLOAD_BYTES,
-        "socket_timeout": 20,
-        "retries": 1,
-        "fragment_retries": 1,
+        "socket_timeout": 30,
+        "retries": 2,
+        "fragment_retries": 2,
+        "overwrites": True,
     }
 
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
-            prepared = Path(ydl.prepare_filename(info))
+            prepared_name = ydl.prepare_filename(info)
 
-        candidates = [
-            p for p in folder.iterdir()
-            if p.is_file()
-            and not p.name.endswith((".part", ".ytdl"))
-        ]
+        prepared = Path(prepared_name)
 
-        if prepared.exists() and prepared.stat().st_size > 0:
-            output = prepared
-        else:
-            valid = [
-                p for p in candidates
-                if p.suffix.lower() in {
-                    ".mp4", ".webm", ".mkv", ".mov"
-                }
-                and p.stat().st_size > 0
+        # Some formats may use a different final extension.
+        if not prepared.exists():
+            alternatives = list(folder.glob(prepared.stem + ".*"))
+            alternatives = [
+                p for p in alternatives
+                if p.is_file()
+                and not p.name.endswith((".part", ".ytdl"))
             ]
+            if alternatives:
+                prepared = alternatives[0]
 
-            if not valid:
-                raise RuntimeError("Downloaded video file not found.")
+        if not prepared.exists() or prepared.stat().st_size == 0:
+            raise RuntimeError("Downloaded file was not found.")
 
-            output = max(valid, key=lambda p: p.stat().st_mtime)
-
-        if output.stat().st_size > MAX_DOWNLOAD_BYTES:
+        if prepared.stat().st_size > MAX_DOWNLOAD_BYTES:
             raise RuntimeError("File exceeds the 100 MB limit.")
 
+        safe_name = re.sub(
+            r"[^A-Za-z0-9._-]",
+            "_",
+            prepared.name,
+        )
+
         return FileResponse(
-            path=str(output),
-            filename=re.sub(
-                r"[^A-Za-z0-9._-]",
-                "_",
-                output.name,
-            ),
+            path=str(prepared),
+            filename=safe_name,
             media_type="application/octet-stream",
             background=BackgroundTask(
                 shutil.rmtree,
@@ -210,15 +210,14 @@ def download_video(request: VideoRequest):
         )
 
     except Exception as exc:
+        logger.exception("FYTI download failed: %s", exc)
         shutil.rmtree(temp_dir, ignore_errors=True)
-
-        if isinstance(exc, HTTPException):
-            raise exc
 
         raise HTTPException(
             status_code=422,
             detail=(
-                "Download failed. The video may be restricted, "
-                "unsupported, or unavailable on this server."
+                "Download failed. Check Render logs for the "
+                "actual error. The video may be restricted, "
+                "unsupported, or exceed the server limit."
             ),
         )
